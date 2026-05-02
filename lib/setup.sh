@@ -283,16 +283,95 @@ run_setup() {
     echo "Step 3: Database Authentication"
     echo "--------------------------------"
 
-    # Detect DB client
+    # Detect available database engines
+    local HAS_MYSQL=false HAS_PG=false
+    command -v mariadb >/dev/null 2>&1 || command -v mysql >/dev/null 2>&1 && HAS_MYSQL=true
+    command -v pg_dump >/dev/null 2>&1 && command -v psql >/dev/null 2>&1 && HAS_PG=true
+
+    # Pick engine
+    DB_ENGINE=""
+    if [[ "$HAS_MYSQL" == "true" && "$HAS_PG" == "true" ]]; then
+      echo "Detected: MySQL/MariaDB and PostgreSQL clients"
+      echo "Which engine would you like to back up?"
+      echo "  1) MySQL/MariaDB"
+      echo "  2) PostgreSQL"
+      read -p "Enter choice [1]: " ENGINE_CHOICE
+      ENGINE_CHOICE="${ENGINE_CHOICE:-1}"
+      case "$ENGINE_CHOICE" in
+        2) DB_ENGINE="postgres" ;;
+        *) DB_ENGINE="mysql" ;;
+      esac
+    elif [[ "$HAS_PG" == "true" ]]; then
+      DB_ENGINE="postgres"
+      echo "PostgreSQL client detected."
+    elif [[ "$HAS_MYSQL" == "true" ]]; then
+      DB_ENGINE="mysql"
+    else
+      print_error "No supported database client found (mysql/mariadb or postgres)."
+      press_enter_to_continue
+      return
+    fi
+    save_config "DB_ENGINE" "$DB_ENGINE"
+    echo
+
+    if [[ "$DB_ENGINE" == "postgres" ]]; then
+      # ---------- PostgreSQL credentials ----------
+      read -p "PostgreSQL host [127.0.0.1]: " PG_HOST
+      PG_HOST="${PG_HOST:-127.0.0.1}"
+      save_config "PG_HOST" "$PG_HOST"
+
+      read -p "PostgreSQL port [5432]: " PG_PORT
+      PG_PORT="${PG_PORT:-5432}"
+      save_config "PG_PORT" "$PG_PORT"
+
+      read -p "PostgreSQL username [postgres]: " DB_USER
+      DB_USER="${DB_USER:-postgres}"
+
+      echo "Leave password empty to use peer/trust authentication (e.g. local socket)."
+      read -sp "PostgreSQL password (empty for none): " DB_PASSWORD
+      echo
+
+      # Test connection
+      local pg_test_args=(-h "$PG_HOST" -p "$PG_PORT" -U "$DB_USER" -d postgres -tAc 'SELECT 1')
+      local pg_test_ok=false
+      if [[ -n "$DB_PASSWORD" ]]; then
+        local _pgpass _pgpass_file
+        _pgpass_file="$(mktemp)"
+        chmod 600 "$_pgpass_file"
+        echo "${PG_HOST}:${PG_PORT}:*:${DB_USER}:${DB_PASSWORD}" > "$_pgpass_file"
+        if PGPASSFILE="$_pgpass_file" psql "${pg_test_args[@]}" >/dev/null 2>&1; then
+          pg_test_ok=true
+        fi
+        rm -f "$_pgpass_file"
+      else
+        if psql "${pg_test_args[@]}" >/dev/null 2>&1; then
+          pg_test_ok=true
+        fi
+      fi
+
+      if [[ "$pg_test_ok" == "true" ]]; then
+        print_success "PostgreSQL connection successful."
+        store_secret "$SECRETS_DIR" "$SECRET_DB_USER" "$DB_USER"
+        if [[ -n "$DB_PASSWORD" ]]; then
+          store_secret "$SECRETS_DIR" "$SECRET_DB_PASS" "$DB_PASSWORD"
+        fi
+        HAVE_DB_CREDS=true
+        print_success "Database credentials stored securely."
+      else
+        print_error "Could not connect to PostgreSQL. Please check host/port/user/password."
+        press_enter_to_continue
+        return
+      fi
+      echo
+      return 0
+    fi
+
+    # ---------- MySQL/MariaDB credentials (existing behavior) ----------
     local DB_CLIENT=""
     if command -v mariadb >/dev/null 2>&1; then
       DB_CLIENT="mariadb"
     elif command -v mysql >/dev/null 2>&1; then
       DB_CLIENT="mysql"
-    else
-      print_error "Neither MariaDB nor MySQL client found."
-      press_enter_to_continue
-      return
     fi
 
     # Determine default database user based on panel
@@ -519,7 +598,8 @@ run_setup() {
 
   generate_all_scripts "$SECRETS_DIR" "$DO_DATABASE" "$DO_FILES" "$RCLONE_REMOTE" \
     "${RCLONE_DB_PATH:-}" "${RCLONE_FILES_PATH:-}" "$RETENTION_DAYS" \
-    "${WEB_PATH_PATTERN:-/var/www/*}" "${WEBROOT_SUBDIR:-.}"
+    "${WEB_PATH_PATTERN:-/var/www/*}" "${WEBROOT_SUBDIR:-.}" \
+    "${DB_ENGINE:-mysql}" "${PG_HOST:-127.0.0.1}" "${PG_PORT:-5432}"
 
   echo
 

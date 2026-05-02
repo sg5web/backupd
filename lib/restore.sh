@@ -160,10 +160,11 @@ inline_restore_database() {
   local secrets_dir="$4"
 
   # Setup cleanup trap for temp files (credential security)
-  local MYSQL_AUTH_FILE="" temp_sql=""
+  local MYSQL_AUTH_FILE="" PG_PASS_FILE="" temp_sql=""
   cleanup_restore_temp_files() {
     [[ -f "${temp_sql:-}" ]] && rm -f "$temp_sql"
     [[ -f "${MYSQL_AUTH_FILE:-}" ]] && rm -f "$MYSQL_AUTH_FILE"
+    [[ -f "${PG_PASS_FILE:-}" ]] && rm -f "$PG_PASS_FILE"
   }
   trap cleanup_restore_temp_files RETURN EXIT INT TERM
 
@@ -177,70 +178,150 @@ inline_restore_database() {
     echo "Using latest snapshot: $snapshot_id"
   fi
 
-  # Detect database client
-  local DB_IMPORT
-  if command -v mariadb >/dev/null 2>&1; then
-    DB_IMPORT="mariadb"
-  elif command -v mysql >/dev/null 2>&1; then
-    DB_IMPORT="mysql"
-  else
-    print_error "No database client found"
-    return 1
-  fi
-
-  # Get database credentials
+  # Get DB credentials (used by both engines)
   local DB_USER DB_PASS
   DB_USER="$(get_secret "$secrets_dir" ".c2" || echo "")"
   DB_PASS="$(get_secret "$secrets_dir" ".c3" || echo "")"
-  local MYSQL_ARGS=()
 
-  if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
-    MYSQL_AUTH_FILE="$(mktemp)"
-    chmod 600 "$MYSQL_AUTH_FILE"
-    cat > "$MYSQL_AUTH_FILE" << AUTHEOF
-[client]
-user=$DB_USER
-password=$DB_PASS
-AUTHEOF
-    MYSQL_ARGS=("--defaults-extra-file=$MYSQL_AUTH_FILE")
-  fi
-
-  # Get database name from snapshot tags
-  local db_name
-  db_name="$(RESTIC_PASSWORD="$password" restic -r "$repo" snapshots "$snapshot_id" --json 2>/dev/null | grep -o 'db:[^"]*' | head -1)"
+  # Get snapshot info (db name + engine tag)
+  local snapshot_info db_name snapshot_engine
+  snapshot_info="$(RESTIC_PASSWORD="$password" restic -r "$repo" snapshots "$snapshot_id" --json 2>/dev/null || echo "[]")"
+  db_name="$(echo "$snapshot_info" | grep -o 'db:[^"]*' | head -1)"
   db_name="${db_name#db:}"
   [[ -z "$db_name" ]] && db_name="unknown"
+  snapshot_engine="$(echo "$snapshot_info" | grep -o 'engine:[^"]*' | head -1)"
+  snapshot_engine="${snapshot_engine#engine:}"
 
-  # Create temp file for SQL dump
-  local temp_sql
-  temp_sql="$(mktemp --suffix=.sql)"
-  chmod 600 "$temp_sql"
+  # Fall back to configured engine if snapshot lacks engine tag (older snapshots)
+  if [[ -z "$snapshot_engine" ]]; then
+    snapshot_engine="$(get_config_value "DB_ENGINE" 2>/dev/null || echo "mysql")"
+    [[ -z "$snapshot_engine" ]] && snapshot_engine="mysql"
+  fi
 
-  echo "Extracting database '$db_name' from snapshot..."
-  if RESTIC_PASSWORD="$password" restic -r "$repo" dump "$snapshot_id" "/${db_name}.sql" > "$temp_sql" 2>/dev/null; then
+  if [[ "$snapshot_engine" == "postgres" ]]; then
+    # ----- PostgreSQL restore -----
+    if ! command -v pg_restore >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then
+      print_error "PostgreSQL client (pg_restore/psql) not found"
+      return 1
+    fi
+
+    local PG_HOST PG_PORT
+    PG_HOST="$(get_config_value "PG_HOST" 2>/dev/null || echo "127.0.0.1")"
+    PG_PORT="$(get_config_value "PG_PORT" 2>/dev/null || echo "5432")"
+    [[ -z "$PG_HOST" ]] && PG_HOST="127.0.0.1"
+    [[ -z "$PG_PORT" ]] && PG_PORT="5432"
+
+    if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
+      PG_PASS_FILE="$(mktemp)"
+      chmod 600 "$PG_PASS_FILE"
+      echo "${PG_HOST}:${PG_PORT}:*:${DB_USER}:${DB_PASS}" > "$PG_PASS_FILE"
+      export PGPASSFILE="$PG_PASS_FILE"
+    fi
+    local PG_USER_ARG=()
+    [[ -n "$DB_USER" ]] && PG_USER_ARG=(-U "$DB_USER")
+
+    local snapshot_filename="/${db_name}.dump"
+    [[ "$db_name" == "_globals" ]] && snapshot_filename="/_globals.sql"
+
+    temp_sql="$(mktemp --suffix=.dump)"
+    chmod 600 "$temp_sql"
+
+    echo "Extracting database '$db_name' from snapshot..."
+    if ! RESTIC_PASSWORD="$password" restic -r "$repo" dump "$snapshot_id" "$snapshot_filename" > "$temp_sql" 2>/dev/null; then
+      print_error "Failed to extract database from snapshot"
+      return 1
+    fi
+
     local sql_size
     sql_size="$(stat -c%s "$temp_sql" 2>/dev/null || echo 0)"
     echo "Extracted $(numfmt --to=iec "$sql_size" 2>/dev/null || echo "$sql_size bytes")"
 
-    echo "Importing database..."
-    if $DB_IMPORT "${MYSQL_ARGS[@]}" < "$temp_sql" 2>&1; then
-      # Post-restore verification: check tables exist
+    if [[ "$db_name" == "_globals" ]]; then
+      echo "Applying cluster globals..."
+      if psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -f "$temp_sql" >/dev/null 2>&1; then
+        print_success "Globals restored successfully"
+      else
+        print_error "Globals restore failed"
+      fi
+      return
+    fi
+
+    # Ensure target DB exists
+    psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -tAc \
+      "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q 1 || \
+      psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -c "CREATE DATABASE \"$db_name\"" >/dev/null 2>&1 || true
+
+    echo "Importing database (pg_restore)..."
+    if pg_restore -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" \
+        --clean --if-exists --no-owner --no-privileges \
+        -d "$db_name" "$temp_sql" 2>&1; then
+      # Post-restore verification: count tables
       local safe_db_name="${db_name//\'/}"
       local table_count
-      table_count=$($DB_IMPORT "${MYSQL_ARGS[@]}" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$safe_db_name'" 2>/dev/null || echo "")
+      table_count=$(psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d "$safe_db_name" -tAc \
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')" 2>/dev/null || echo "")
       table_count=$(echo "$table_count" | tr -d '[:space:]')
       if [[ -n "$table_count" && "$table_count" -gt 0 ]]; then
         print_success "Database restored successfully ($table_count tables verified)"
-      elif [[ "$db_name" == "unknown" ]]; then
-        print_success "Database restored successfully"
       else
-        print_warning "Database imported but no tables found in '$db_name'"
+        print_warning "Database imported but no user tables found in '$db_name'"
       fi
     else
       print_error "Database import failed"
     fi
   else
-    print_error "Failed to extract database from snapshot"
+    # ----- MySQL / MariaDB restore (existing behavior) -----
+    local DB_IMPORT
+    if command -v mariadb >/dev/null 2>&1; then
+      DB_IMPORT="mariadb"
+    elif command -v mysql >/dev/null 2>&1; then
+      DB_IMPORT="mysql"
+    else
+      print_error "No database client found"
+      return 1
+    fi
+
+    local MYSQL_ARGS=()
+    if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
+      MYSQL_AUTH_FILE="$(mktemp)"
+      chmod 600 "$MYSQL_AUTH_FILE"
+      cat > "$MYSQL_AUTH_FILE" << AUTHEOF
+[client]
+user=$DB_USER
+password=$DB_PASS
+AUTHEOF
+      MYSQL_ARGS=("--defaults-extra-file=$MYSQL_AUTH_FILE")
+    fi
+
+    temp_sql="$(mktemp --suffix=.sql)"
+    chmod 600 "$temp_sql"
+
+    echo "Extracting database '$db_name' from snapshot..."
+    if RESTIC_PASSWORD="$password" restic -r "$repo" dump "$snapshot_id" "/${db_name}.sql" > "$temp_sql" 2>/dev/null; then
+      local sql_size
+      sql_size="$(stat -c%s "$temp_sql" 2>/dev/null || echo 0)"
+      echo "Extracted $(numfmt --to=iec "$sql_size" 2>/dev/null || echo "$sql_size bytes")"
+
+      echo "Importing database..."
+      if $DB_IMPORT "${MYSQL_ARGS[@]}" < "$temp_sql" 2>&1; then
+        # Post-restore verification: check tables exist
+        local safe_db_name="${db_name//\'/}"
+        local table_count
+        table_count=$($DB_IMPORT "${MYSQL_ARGS[@]}" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$safe_db_name'" 2>/dev/null || echo "")
+        table_count=$(echo "$table_count" | tr -d '[:space:]')
+        if [[ -n "$table_count" && "$table_count" -gt 0 ]]; then
+          print_success "Database restored successfully ($table_count tables verified)"
+        elif [[ "$db_name" == "unknown" ]]; then
+          print_success "Database restored successfully"
+        else
+          print_warning "Database imported but no tables found in '$db_name'"
+        fi
+      else
+        print_error "Database import failed"
+      fi
+    else
+      print_error "Failed to extract database from snapshot"
+    fi
   fi
   # Cleanup handled by trap set at function start
 }

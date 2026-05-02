@@ -437,6 +437,7 @@ do_migrate_encryption() {
 regenerate_all_scripts() {
   local secrets_dir rclone_remote rclone_db_path rclone_files_path retention_days
   local web_path_pattern webroot_subdir do_database do_files
+  local db_engine pg_host pg_port
 
   secrets_dir="$(get_secrets_dir)"
   rclone_remote="$(get_config_value "RCLONE_REMOTE")"
@@ -450,11 +451,18 @@ regenerate_all_scripts() {
   webroot_subdir="${webroot_subdir:-.}"
   do_database="$(get_config_value "DO_DATABASE")"
   do_files="$(get_config_value "DO_FILES")"
+  db_engine="$(get_config_value "DB_ENGINE")"
+  db_engine="${db_engine:-mysql}"
+  pg_host="$(get_config_value "PG_HOST")"
+  pg_host="${pg_host:-127.0.0.1}"
+  pg_port="$(get_config_value "PG_PORT")"
+  pg_port="${pg_port:-5432}"
 
   # Regenerate all scripts using v3.0 unified generator
   generate_all_scripts "$secrets_dir" "$do_database" "$do_files" "$rclone_remote" \
     "$rclone_db_path" "$rclone_files_path" "$retention_days" \
-    "$web_path_pattern" "$webroot_subdir"
+    "$web_path_pattern" "$webroot_subdir" \
+    "$db_engine" "$pg_host" "$pg_port"
 }
 
 parse_arguments() {

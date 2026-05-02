@@ -34,14 +34,17 @@ generate_all_scripts() {
   local RETENTION_DAYS="${7:-30}"  # Changed from MINUTES to DAYS
   local WEB_PATH_PATTERN="${8:-/var/www/*}"
   local WEBROOT_SUBDIR="${9:-.}"
+  local DB_ENGINE="${10:-mysql}"   # mysql | mariadb | postgres
+  local PG_HOST="${11:-127.0.0.1}"
+  local PG_PORT="${12:-5432}"
 
   local LOGS_DIR="$INSTALL_DIR/logs"
   mkdir -p "$LOGS_DIR"
 
   # Generate database backup script (restic-based)
   if [[ "$DO_DATABASE" == "true" ]]; then
-    generate_restic_db_backup_script "$SECRETS_DIR" "$RCLONE_REMOTE" "$RCLONE_DB_PATH" "$LOGS_DIR" "$RETENTION_DAYS"
-    print_success "Database backup script generated (restic)"
+    generate_restic_db_backup_script "$SECRETS_DIR" "$RCLONE_REMOTE" "$RCLONE_DB_PATH" "$LOGS_DIR" "$RETENTION_DAYS" "$DB_ENGINE" "$PG_HOST" "$PG_PORT"
+    print_success "Database backup script generated (restic, engine=$DB_ENGINE)"
   fi
 
   # Generate files backup script (restic-based)
@@ -51,8 +54,8 @@ generate_all_scripts() {
   fi
 
   # Generate unified restore script (restic-based)
-  generate_restic_restore_script "$SECRETS_DIR" "$RCLONE_REMOTE" "$RCLONE_DB_PATH" "$RCLONE_FILES_PATH"
-  print_success "Restore script generated (restic)"
+  generate_restic_restore_script "$SECRETS_DIR" "$RCLONE_REMOTE" "$RCLONE_DB_PATH" "$RCLONE_FILES_PATH" "$DB_ENGINE" "$PG_HOST" "$PG_PORT"
+  print_success "Restore script generated (restic, engine=$DB_ENGINE)"
 
   # Generate verification scripts (restic-based)
   generate_restic_verify_script "$SECRETS_DIR" "$RCLONE_REMOTE" "$RCLONE_DB_PATH" "$RCLONE_FILES_PATH"
@@ -67,6 +70,9 @@ generate_restic_db_backup_script() {
   local RCLONE_PATH="$3"
   local LOGS_DIR="$4"
   local RETENTION_DAYS="${5:-30}"
+  local DB_ENGINE="${6:-mysql}"
+  local PG_HOST="${7:-127.0.0.1}"
+  local PG_PORT="${8:-5432}"
 
   cat > "$SCRIPTS_DIR/db_backup.sh" << 'DBBACKUPEOF'
 #!/usr/bin/env bash
@@ -97,6 +103,9 @@ RCLONE_REMOTE="%%RCLONE_REMOTE%%"
 RCLONE_PATH="%%RCLONE_PATH%%"
 LOGS_DIR="%%LOGS_DIR%%"
 RETENTION_DAYS="%%RETENTION_DAYS%%"
+DB_ENGINE="%%DB_ENGINE%%"
+PG_HOST="%%PG_HOST%%"
+PG_PORT="%%PG_PORT%%"
 HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
 LOG_PREFIX="[DB-BACKUP]"
 
@@ -146,6 +155,7 @@ write_progress "initializing" 0 "Starting database backup"
 
 # Cleanup function
 MYSQL_AUTH_FILE=""
+PG_PASS_FILE=""
 cleanup() {
   local exit_code=$?
   # Update progress to failed if exiting with error
@@ -153,6 +163,7 @@ cleanup() {
     write_progress "error" 0 "Backup failed (exit code: $exit_code)" "failed"
   fi
   [[ -n "$MYSQL_AUTH_FILE" && -f "$MYSQL_AUTH_FILE" ]] && rm -f "$MYSQL_AUTH_FILE"
+  [[ -n "$PG_PASS_FILE" && -f "$PG_PASS_FILE" ]] && rm -f "$PG_PASS_FILE"
   log_end 2>/dev/null || true
   exit $exit_code
 }
@@ -332,72 +343,153 @@ if ! repo_exists "$REPO" "$RESTIC_PASSWORD"; then
   log_info "Repository initialized"
 fi
 
-# Detect DB client
-if command -v mariadb >/dev/null 2>&1; then
-  DB_CLIENT="mariadb"; DB_DUMP="mariadb-dump"
-elif command -v mysql >/dev/null 2>&1; then
-  DB_CLIENT="mysql"; DB_DUMP="mysqldump"
-else
-  log_error "No database client found"
-  send_notification "DB Backup Failed on $HOSTNAME" "No database client found" "backup_failed" "{}" "1" "siren"
-  exit 5
-fi
+# Resolve DB engine (default mysql for backwards compat with v3.0 configs)
+DB_ENGINE="${DB_ENGINE:-mysql}"
 
-# Get DB credentials and create auth file (more secure than command line)
+# Get DB credentials (used by both mysql/mariadb and postgres branches)
 DB_USER="$(get_secret "$SECRETS_DIR" "$SECRET_DB_USER" || echo "")"
 DB_PASS="$(get_secret "$SECRETS_DIR" "$SECRET_DB_PASS" || echo "")"
-MYSQL_ARGS=()
 
-if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
-  # Use defaults-extra-file to hide password from process list
-  MYSQL_AUTH_FILE="$(mktemp)"
-  chmod 600 "$MYSQL_AUTH_FILE"
-  cat > "$MYSQL_AUTH_FILE" << AUTHEOF
+if [[ "$DB_ENGINE" == "postgres" ]]; then
+  # ----- PostgreSQL branch -----
+  if ! command -v pg_dump >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then
+    log_error "PostgreSQL client (pg_dump/psql) not found"
+    send_notification "DB Backup Failed on $HOSTNAME" "pg_dump/psql not found" "backup_failed" "{}" "1" "siren"
+    exit 5
+  fi
+
+  # Build PGPASSFILE so password never appears in process list
+  if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
+    PG_PASS_FILE="$(mktemp)"
+    chmod 600 "$PG_PASS_FILE"
+    # Format: hostname:port:database:username:password (* = wildcard)
+    echo "${PG_HOST}:${PG_PORT}:*:${DB_USER}:${DB_PASS}" > "$PG_PASS_FILE"
+    export PGPASSFILE="$PG_PASS_FILE"
+  fi
+
+  PG_USER_ARG=()
+  [[ -n "$DB_USER" ]] && PG_USER_ARG=(-U "$DB_USER")
+
+  # List user databases (exclude templates and built-in 'postgres')
+  DBS="$(psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -tAc \
+    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname NOT IN ('postgres')" 2>/dev/null || true)"
+
+  if [[ -z "$DBS" ]]; then
+    log_error "No databases found or cannot connect to PostgreSQL"
+    send_notification "DB Backup Failed on $HOSTNAME" "No databases found" "backup_failed" "{}" "1" "siren"
+    exit 6
+  fi
+
+  # Backup each database using restic (custom format = parallel-restorable, smaller)
+  declare -a failures=()
+  db_count=0
+  total_dbs=$(echo "$DBS" | wc -w)
+  write_progress "backing_up" 15 "Backing up $total_dbs databases (postgres)"
+
+  # Cluster-wide globals (roles, tablespaces) — once per run
+  echo "$LOG_PREFIX Backing up cluster globals (roles/tablespaces)"
+  if pg_dumpall -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" --globals-only 2>/dev/null | \
+    RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$REPO" backup \
+      --retry-lock 2m \
+      --stdin \
+      --stdin-filename "_globals.sql" \
+      --tag "database" \
+      --tag "engine:postgres" \
+      --tag "db:_globals" \
+      --host "$HOSTNAME" 2>&1; then
+    echo "$LOG_PREFIX   OK: _globals"
+  else
+    echo "$LOG_PREFIX   WARNING: _globals dump failed (continuing with per-DB dumps)"
+  fi
+
+  for db in $DBS; do
+    echo "$LOG_PREFIX Backing up database: $db"
+    progress_pct=$((15 + (db_count * 60 / total_dbs)))
+    write_progress "backing_up" $progress_pct "Backing up: $db"
+
+    if pg_dump -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" \
+        --format=custom --no-owner --no-privileges -d "$db" 2>/dev/null | \
+      RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$REPO" backup \
+        --retry-lock 2m \
+        --stdin \
+        --stdin-filename "${db}.dump" \
+        --tag "database" \
+        --tag "engine:postgres" \
+        --tag "db:${db}" \
+        --host "$HOSTNAME" 2>&1; then
+      echo "$LOG_PREFIX   OK: $db"
+      ((db_count++)) || true
+    else
+      echo "$LOG_PREFIX   FAILED: $db"
+      failures+=("$db")
+    fi
+  done
+
+else
+  # ----- MySQL / MariaDB branch (existing behavior) -----
+  if command -v mariadb >/dev/null 2>&1; then
+    DB_CLIENT="mariadb"; DB_DUMP="mariadb-dump"
+  elif command -v mysql >/dev/null 2>&1; then
+    DB_CLIENT="mysql"; DB_DUMP="mysqldump"
+  else
+    log_error "No database client found"
+    send_notification "DB Backup Failed on $HOSTNAME" "No database client found" "backup_failed" "{}" "1" "siren"
+    exit 5
+  fi
+
+  MYSQL_ARGS=()
+  if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
+    # Use defaults-extra-file to hide password from process list
+    MYSQL_AUTH_FILE="$(mktemp)"
+    chmod 600 "$MYSQL_AUTH_FILE"
+    cat > "$MYSQL_AUTH_FILE" << AUTHEOF
 [client]
 user=$DB_USER
 password=$DB_PASS
 AUTHEOF
-  MYSQL_ARGS=("--defaults-extra-file=$MYSQL_AUTH_FILE")
-fi
-
-# Get databases to backup
-EXCLUDE_REGEX='^(information_schema|performance_schema|sys|mysql)$'
-DBS="$($DB_CLIENT "${MYSQL_ARGS[@]}" -NBe 'SHOW DATABASES' 2>/dev/null | grep -Ev "$EXCLUDE_REGEX" || true)"
-
-if [[ -z "$DBS" ]]; then
-  log_error "No databases found or cannot connect to database"
-  send_notification "DB Backup Failed on $HOSTNAME" "No databases found" "backup_failed" "{}" "1" "siren"
-  exit 6
-fi
-
-# Backup each database using restic
-declare -a failures=()
-db_count=0
-total_dbs=$(echo "$DBS" | wc -w)
-write_progress "backing_up" 15 "Backing up $total_dbs databases"
-
-for db in $DBS; do
-  echo "$LOG_PREFIX Backing up database: $db"
-  progress_pct=$((15 + (db_count * 60 / total_dbs)))
-  write_progress "backing_up" $progress_pct "Backing up: $db"
-
-  # Backup database via stdin to restic
-  if $DB_DUMP "${MYSQL_ARGS[@]}" --databases "$db" --single-transaction --quick \
-      --routines --events --triggers --hex-blob --default-character-set=utf8mb4 2>/dev/null | \
-    RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$REPO" backup \
-      --retry-lock 2m \
-      --stdin \
-      --stdin-filename "${db}.sql" \
-      --tag "database" \
-      --tag "db:${db}" \
-      --host "$HOSTNAME" 2>&1; then
-    echo "$LOG_PREFIX   OK: $db"
-    ((db_count++)) || true
-  else
-    echo "$LOG_PREFIX   FAILED: $db"
-    failures+=("$db")
+    MYSQL_ARGS=("--defaults-extra-file=$MYSQL_AUTH_FILE")
   fi
-done
+
+  # Get databases to backup
+  EXCLUDE_REGEX='^(information_schema|performance_schema|sys|mysql)$'
+  DBS="$($DB_CLIENT "${MYSQL_ARGS[@]}" -NBe 'SHOW DATABASES' 2>/dev/null | grep -Ev "$EXCLUDE_REGEX" || true)"
+
+  if [[ -z "$DBS" ]]; then
+    log_error "No databases found or cannot connect to database"
+    send_notification "DB Backup Failed on $HOSTNAME" "No databases found" "backup_failed" "{}" "1" "siren"
+    exit 6
+  fi
+
+  # Backup each database using restic
+  declare -a failures=()
+  db_count=0
+  total_dbs=$(echo "$DBS" | wc -w)
+  write_progress "backing_up" 15 "Backing up $total_dbs databases"
+
+  for db in $DBS; do
+    echo "$LOG_PREFIX Backing up database: $db"
+    progress_pct=$((15 + (db_count * 60 / total_dbs)))
+    write_progress "backing_up" $progress_pct "Backing up: $db"
+
+    # Backup database via stdin to restic
+    if $DB_DUMP "${MYSQL_ARGS[@]}" --databases "$db" --single-transaction --quick \
+        --routines --events --triggers --hex-blob --default-character-set=utf8mb4 2>/dev/null | \
+      RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$REPO" backup \
+        --retry-lock 2m \
+        --stdin \
+        --stdin-filename "${db}.sql" \
+        --tag "database" \
+        --tag "engine:mysql" \
+        --tag "db:${db}" \
+        --host "$HOSTNAME" 2>&1; then
+      echo "$LOG_PREFIX   OK: $db"
+      ((db_count++)) || true
+    else
+      echo "$LOG_PREFIX   FAILED: $db"
+      failures+=("$db")
+    fi
+  done
+fi
 
 if [[ $db_count -eq 0 ]]; then
   log_error "All database backups failed"
@@ -447,11 +539,15 @@ DBBACKUPEOF
 
   # Replace placeholders (escape special sed chars)
   local esc_secrets_dir esc_rclone_remote esc_rclone_path esc_logs_dir esc_install_dir
+  local esc_db_engine esc_pg_host esc_pg_port
   esc_secrets_dir=$(escape_sed_replacement "$SECRETS_DIR")
   esc_rclone_remote=$(escape_sed_replacement "$RCLONE_REMOTE")
   esc_rclone_path=$(escape_sed_replacement "$RCLONE_PATH")
   esc_logs_dir=$(escape_sed_replacement "$LOGS_DIR")
   esc_install_dir=$(escape_sed_replacement "$INSTALL_DIR")
+  esc_db_engine=$(escape_sed_replacement "$DB_ENGINE")
+  esc_pg_host=$(escape_sed_replacement "$PG_HOST")
+  esc_pg_port=$(escape_sed_replacement "$PG_PORT")
   sed -i \
     -e "s|%%INSTALL_DIR%%|$esc_install_dir|g" \
     -e "s|%%SECRETS_DIR%%|$esc_secrets_dir|g" \
@@ -459,6 +555,9 @@ DBBACKUPEOF
     -e "s|%%RCLONE_PATH%%|$esc_rclone_path|g" \
     -e "s|%%LOGS_DIR%%|$esc_logs_dir|g" \
     -e "s|%%RETENTION_DAYS%%|$RETENTION_DAYS|g" \
+    -e "s|%%DB_ENGINE%%|$esc_db_engine|g" \
+    -e "s|%%PG_HOST%%|$esc_pg_host|g" \
+    -e "s|%%PG_PORT%%|$esc_pg_port|g" \
     "$SCRIPTS_DIR/db_backup.sh"
 
   chmod +x "$SCRIPTS_DIR/db_backup.sh"
@@ -933,6 +1032,9 @@ generate_restic_restore_script() {
   local RCLONE_REMOTE="$2"
   local RCLONE_DB_PATH="$3"
   local RCLONE_FILES_PATH="$4"
+  local DB_ENGINE="${5:-mysql}"
+  local PG_HOST="${6:-127.0.0.1}"
+  local PG_PORT="${7:-5432}"
 
   cat > "$SCRIPTS_DIR/restore.sh" << 'RESTOREEOF'
 #!/usr/bin/env bash
@@ -957,6 +1059,9 @@ SECRETS_DIR="%%SECRETS_DIR%%"
 RCLONE_REMOTE="%%RCLONE_REMOTE%%"
 RCLONE_DB_PATH="%%RCLONE_DB_PATH%%"
 RCLONE_FILES_PATH="%%RCLONE_FILES_PATH%%"
+DB_ENGINE="%%DB_ENGINE%%"
+PG_HOST="%%PG_HOST%%"
+PG_PORT="%%PG_PORT%%"
 HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
 
 # Secret file names
@@ -974,10 +1079,12 @@ BOLD='\033[1m'
 
 # Cleanup function
 MYSQL_AUTH_FILE=""
+PG_PASS_FILE=""
 TEMP_SQL_FILE=""
 cleanup() {
   local exit_code=$?
   [[ -n "$MYSQL_AUTH_FILE" && -f "$MYSQL_AUTH_FILE" ]] && rm -f "$MYSQL_AUTH_FILE"
+  [[ -n "$PG_PASS_FILE" && -f "$PG_PASS_FILE" ]] && rm -f "$PG_PASS_FILE"
   [[ -n "$TEMP_SQL_FILE" && -f "$TEMP_SQL_FILE" ]] && rm -f "$TEMP_SQL_FILE"
   exit $exit_code
 }
@@ -1124,63 +1231,140 @@ restore_database_menu() {
   read -p "Type 'yes' to confirm: " confirm
   [[ "$confirm" != "yes" ]] && { print_warning "Restore cancelled"; press_enter; return; }
 
-  # Detect database client
-  local DB_CLIENT DB_IMPORT
-  if command -v mariadb >/dev/null 2>&1; then
-    DB_CLIENT="mariadb"; DB_IMPORT="mariadb"
-  elif command -v mysql >/dev/null 2>&1; then
-    DB_CLIENT="mysql"; DB_IMPORT="mysql"
-  else
-    print_error "No database client found (mysql/mariadb)"
-    press_enter
-    return
-  fi
+  # Determine engine for this snapshot — prefer tag, fall back to configured DB_ENGINE
+  local snapshot_engine
+  snapshot_engine="$(echo "$snapshot_info" | grep -o 'engine:[^"]*' | head -1)"
+  snapshot_engine="${snapshot_engine#engine:}"
+  [[ -z "$snapshot_engine" ]] && snapshot_engine="$DB_ENGINE"
 
-  # Get database credentials
-  local DB_USER DB_PASS MYSQL_ARGS
+  # Get database credentials (used by both branches)
+  local DB_USER DB_PASS
   DB_USER="$(get_secret "$SECRETS_DIR" "$SECRET_DB_USER" || echo "")"
   DB_PASS="$(get_secret "$SECRETS_DIR" "$SECRET_DB_PASS" || echo "")"
-  MYSQL_ARGS=()
 
-  if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
-    MYSQL_AUTH_FILE="$(mktemp)"
-    chmod 600 "$MYSQL_AUTH_FILE"
-    cat > "$MYSQL_AUTH_FILE" << AUTHEOF
+  if [[ "$snapshot_engine" == "postgres" ]]; then
+    # ----- PostgreSQL restore -----
+    if ! command -v pg_restore >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then
+      print_error "PostgreSQL client (pg_restore/psql) not found"
+      press_enter
+      return
+    fi
+
+    if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
+      PG_PASS_FILE="$(mktemp)"
+      chmod 600 "$PG_PASS_FILE"
+      echo "${PG_HOST}:${PG_PORT}:*:${DB_USER}:${DB_PASS}" > "$PG_PASS_FILE"
+      export PGPASSFILE="$PG_PASS_FILE"
+    fi
+    local PG_USER_ARG=()
+    [[ -n "$DB_USER" ]] && PG_USER_ARG=(-U "$DB_USER")
+
+    # Dump snapshot to temp file (custom-format archive)
+    echo
+    print_info "Extracting database from snapshot..."
+    TEMP_SQL_FILE="$(mktemp --suffix=.dump)"
+    chmod 600 "$TEMP_SQL_FILE"
+
+    local snapshot_filename="/${db_name}.dump"
+    [[ "$db_name" == "_globals" ]] && snapshot_filename="/_globals.sql"
+
+    if ! RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$DB_REPO" dump "$snapshot_id" "$snapshot_filename" > "$TEMP_SQL_FILE" 2>/dev/null; then
+      print_error "Failed to extract database from snapshot"
+      press_enter
+      return
+    fi
+
+    local sql_size
+    sql_size="$(stat -c%s "$TEMP_SQL_FILE" 2>/dev/null || echo 0)"
+    if [[ "$sql_size" -lt 100 ]]; then
+      print_error "Extracted file too small ($sql_size bytes) - snapshot may be corrupt"
+      press_enter
+      return
+    fi
+    print_success "Extracted $(numfmt --to=iec "$sql_size" 2>/dev/null || echo "$sql_size bytes")"
+
+    # Globals: apply with psql to maintenance DB
+    if [[ "$db_name" == "_globals" ]]; then
+      print_info "Applying cluster globals..."
+      if psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -f "$TEMP_SQL_FILE" >/dev/null 2>&1; then
+        print_success "Globals restored successfully!"
+      else
+        print_error "Globals restore failed"
+      fi
+      press_enter
+      return
+    fi
+
+    # Per-DB restore: ensure target DB exists, then pg_restore --clean
+    print_info "Ensuring database '$db_name' exists..."
+    psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -tAc \
+      "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q 1 || \
+      psql -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" -d postgres -c "CREATE DATABASE \"$db_name\"" >/dev/null 2>&1 || true
+
+    print_info "Importing database (pg_restore)..."
+    if pg_restore -h "$PG_HOST" -p "$PG_PORT" "${PG_USER_ARG[@]}" \
+        --clean --if-exists --no-owner --no-privileges \
+        -d "$db_name" "$TEMP_SQL_FILE" 2>&1; then
+      print_success "Database '$db_name' restored successfully!"
+    else
+      print_error "Database import failed"
+    fi
+  else
+    # ----- MySQL / MariaDB restore (existing behavior) -----
+    local DB_CLIENT DB_IMPORT
+    if command -v mariadb >/dev/null 2>&1; then
+      DB_CLIENT="mariadb"; DB_IMPORT="mariadb"
+    elif command -v mysql >/dev/null 2>&1; then
+      DB_CLIENT="mysql"; DB_IMPORT="mysql"
+    else
+      print_error "No database client found (mysql/mariadb)"
+      press_enter
+      return
+    fi
+
+    local MYSQL_ARGS
+    MYSQL_ARGS=()
+
+    if [[ -n "$DB_USER" && -n "$DB_PASS" ]]; then
+      MYSQL_AUTH_FILE="$(mktemp)"
+      chmod 600 "$MYSQL_AUTH_FILE"
+      cat > "$MYSQL_AUTH_FILE" << AUTHEOF
 [client]
 user=$DB_USER
 password=$DB_PASS
 AUTHEOF
-    MYSQL_ARGS=("--defaults-extra-file=$MYSQL_AUTH_FILE")
-  fi
+      MYSQL_ARGS=("--defaults-extra-file=$MYSQL_AUTH_FILE")
+    fi
 
-  # Dump snapshot to temp file
-  echo
-  print_info "Extracting database from snapshot..."
-  TEMP_SQL_FILE="$(mktemp --suffix=.sql)"
-  chmod 600 "$TEMP_SQL_FILE"
+    # Dump snapshot to temp file
+    echo
+    print_info "Extracting database from snapshot..."
+    TEMP_SQL_FILE="$(mktemp --suffix=.sql)"
+    chmod 600 "$TEMP_SQL_FILE"
 
-  if ! RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$DB_REPO" dump "$snapshot_id" "/${db_name}.sql" > "$TEMP_SQL_FILE" 2>/dev/null; then
-    print_error "Failed to extract database from snapshot"
-    press_enter
-    return
-  fi
+    if ! RESTIC_PASSWORD="$RESTIC_PASSWORD" restic -r "$DB_REPO" dump "$snapshot_id" "/${db_name}.sql" > "$TEMP_SQL_FILE" 2>/dev/null; then
+      print_error "Failed to extract database from snapshot"
+      press_enter
+      return
+    fi
 
-  local sql_size
-  sql_size="$(stat -c%s "$TEMP_SQL_FILE" 2>/dev/null || echo 0)"
-  if [[ "$sql_size" -lt 100 ]]; then
-    print_error "Extracted file too small ($sql_size bytes) - snapshot may be corrupt"
-    press_enter
-    return
-  fi
+    local sql_size
+    sql_size="$(stat -c%s "$TEMP_SQL_FILE" 2>/dev/null || echo 0)"
+    if [[ "$sql_size" -lt 100 ]]; then
+      print_error "Extracted file too small ($sql_size bytes) - snapshot may be corrupt"
+      press_enter
+      return
+    fi
 
-  print_success "Extracted $(numfmt --to=iec "$sql_size" 2>/dev/null || echo "$sql_size bytes")"
+    print_success "Extracted $(numfmt --to=iec "$sql_size" 2>/dev/null || echo "$sql_size bytes")"
 
-  # Import to database
-  print_info "Importing database..."
-  if $DB_IMPORT "${MYSQL_ARGS[@]}" < "$TEMP_SQL_FILE" 2>&1; then
-    print_success "Database '$db_name' restored successfully!"
-  else
-    print_error "Database import failed"
+    # Import to database
+    print_info "Importing database..."
+    if $DB_IMPORT "${MYSQL_ARGS[@]}" < "$TEMP_SQL_FILE" 2>&1; then
+      print_success "Database '$db_name' restored successfully!"
+    else
+      print_error "Database import failed"
+    fi
   fi
 
   press_enter
@@ -1412,17 +1596,24 @@ RESTOREEOF
 
   # Replace placeholders (escape special sed chars)
   local esc_secrets_dir esc_rclone_remote esc_db_path esc_files_path esc_install_dir
+  local esc_db_engine esc_pg_host esc_pg_port
   esc_secrets_dir=$(escape_sed_replacement "$SECRETS_DIR")
   esc_rclone_remote=$(escape_sed_replacement "$RCLONE_REMOTE")
   esc_db_path=$(escape_sed_replacement "$RCLONE_DB_PATH")
   esc_files_path=$(escape_sed_replacement "$RCLONE_FILES_PATH")
   esc_install_dir=$(escape_sed_replacement "$INSTALL_DIR")
+  esc_db_engine=$(escape_sed_replacement "$DB_ENGINE")
+  esc_pg_host=$(escape_sed_replacement "$PG_HOST")
+  esc_pg_port=$(escape_sed_replacement "$PG_PORT")
   sed -i \
     -e "s|%%INSTALL_DIR%%|$esc_install_dir|g" \
     -e "s|%%SECRETS_DIR%%|$esc_secrets_dir|g" \
     -e "s|%%RCLONE_REMOTE%%|$esc_rclone_remote|g" \
     -e "s|%%RCLONE_DB_PATH%%|$esc_db_path|g" \
     -e "s|%%RCLONE_FILES_PATH%%|$esc_files_path|g" \
+    -e "s|%%DB_ENGINE%%|$esc_db_engine|g" \
+    -e "s|%%PG_HOST%%|$esc_pg_host|g" \
+    -e "s|%%PG_PORT%%|$esc_pg_port|g" \
     "$SCRIPTS_DIR/restore.sh"
 
   chmod +x "$SCRIPTS_DIR/restore.sh"
