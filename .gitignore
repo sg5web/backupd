@@ -69,6 +69,8 @@ CLAUDE_INDEX.md
 test/
 # Keep smoke_test.sh for CI (negation below)
 test_*
+# Allow versioned test scripts under tests/
+!tests/**/test_*.sh
 
 # ----- Development -----
 dev/
